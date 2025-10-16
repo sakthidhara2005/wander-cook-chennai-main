@@ -12,15 +12,84 @@ import {
   Image as ImageIcon
 } from "lucide-react";
 import ingredientsImage from "@/assets/ingredients-upload.jpg";
+import { genAI } from "../lib/geminiClient";
+import { supabase } from "@/lib/supabaseClient";  // ✅ Added import
 
 const Upload = () => {
   const [uploadedImage, setUploadedImage] = useState<string | null>(null);
   const [isProcessing, setIsProcessing] = useState(false);
   const [isProcessed, setIsProcessed] = useState(false);
-  const [detectedObjects, setDetectedObjects] = useState<Array<{ label: string; confidence: number }>>([]);
+  const [detectedObjects, setDetectedObjects] = useState<Array<{ label: string; confidence?: number }>>([]);
   const [recipeText, setRecipeText] = useState<string>("");
+  const [manualIngredient, setManualIngredient] = useState<string>("");
+  const [manualLoading, setManualLoading] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const { toast } = useToast();
+
+  // ✅ Fixed Manual ingredient search handler
+  const handleManualSearch = async (e: React.FormEvent) => {
+    e.preventDefault();
+    const query = manualIngredient.trim();
+    if (!query) return;
+
+    setManualLoading(true);
+    setRecipeText("");
+
+    try {
+      // Step 1: Find ingredient IDs that match the search text
+      const { data: ingredients, error: ingredientError } = await supabase
+        .from("ingredients")
+        .select("id, name")
+        .ilike("name", `%${query}%`);
+
+      if (ingredientError) throw ingredientError;
+      if (!ingredients || ingredients.length === 0) {
+        setRecipeText("No matching ingredients found.");
+        try {
+          // Query Supabase for recipes containing the entered ingredient (at least one match)
+          const { data, error } = await supabase
+            .from("recipes")
+            .select("title, description, recipe_ingredients(ingredient_id, ingredients(name))")
+            .contains("recipe_ingredients.ingredients.name", [manualIngredient.trim()]);
+          console.log('Supabase recipe response:', data, error);
+          if (error) {
+            setRecipeText("Could not fetch recipe suggestions.");
+          } else if (data && data.length > 0) {
+            // Find the first recipe with at least one matching ingredient (case-insensitive)
+            const inputIngredient = manualIngredient.trim().toLowerCase();
+            const matchingRecipe = data.find(recipe =>
+              recipe.recipe_ingredients?.some(ri =>
+                ri.ingredients?.name?.toLowerCase() === inputIngredient
+              )
+            );
+            // If no exact match, try partial match
+            const fallbackRecipe = !matchingRecipe ? data.find(recipe =>
+              recipe.recipe_ingredients?.some(ri =>
+                ri.ingredients?.name?.toLowerCase().includes(inputIngredient)
+              )
+            ) : null;
+            const recipeToShow = matchingRecipe || fallbackRecipe || data[0];
+            setRecipeText(`Suggested Recipe: ${recipeToShow.title}\n${recipeToShow.description || ""}`);
+          } else {
+            setRecipeText("No matching recipes found in database.");
+          }
+        } catch (err) {
+          setRecipeText("Error suggesting recipe from database.");
+        } finally {
+          setManualLoading(false);
+        }
+        const recipe = recipes[0];
+        setRecipeText(`Suggested Recipe: ${recipe.title}\n${recipe.description || ""}`);
+      } else {
+        setRecipeText("No matching recipes found in database.");
+      }
+    } catch (err) {
+      console.error("Manual ingredient search error:", err);
+      setRecipeText("Error suggesting recipe from database.");
+    } finally {
+      setManualLoading(false);
+    }
+  };
 
   const handleImageUpload = (event: React.ChangeEvent<HTMLInputElement>) => {
     const file = event.target.files?.[0];
@@ -41,72 +110,73 @@ const Upload = () => {
     setRecipeText("");
 
     try {
-      const apiUrl = (import.meta as any).env?.VITE_ANALYZE_API_URL as string | undefined;
-      const apiKey = (import.meta as any).env?.VITE_ANALYZE_API_KEY as string | undefined;
+      // Use Gemini AI for image ingredient detection
+      const model = genAI.getGenerativeModel({ model: "gemini-pro-vision" });
+      const reader = new FileReader();
+      reader.onload = async (event) => {
+        try {
+          const base64 = (event.target?.result as string).split(",")[1];
+          const result = await model.generateContent([
+            { inlineData: { mimeType: file.type, data: base64 } },
+            "What food items or ingredients are visible in this image? List only what you see, one per line."
+          ]);
+          const text = result.response.text();
+          // Parse ingredient names from Gemini response
+          const lines = text.split(/\r?\n/).map(l => l.trim()).filter(Boolean);
+          const ingredients = lines.map((line) => ({ label: line }));
+          setDetectedObjects(ingredients);
+          setIsProcessed(true);
+          toast({
+            title: "Gemini AI Analysis complete",
+            description: `Found ${ingredients.length} items`,
+            duration: 3500,
+          });
 
-      if (apiUrl) {
-        const formData = new FormData();
-        // Common field names
-        formData.append("file", file);
-        formData.append("image", file);
-
-        const headers: Record<string, string> = {};
-        if (apiKey) headers["Authorization"] = `Bearer ${apiKey}`;
-
-        const res = await fetch(apiUrl, { method: "POST", headers, body: formData });
-        if (!res.ok) throw new Error(`Analyze API failed (${res.status})`);
-        const data = await res.json();
-
-        const objects = Array.isArray(data.objects)
-          ? data.objects
-          : Array.isArray(data.detections)
-            ? data.detections
-            : [];
-
-        setDetectedObjects(
-          objects.map((o: any) => ({
-            label: String(o.label ?? o.name ?? "ingredient"),
-            confidence: Number(o.confidence ?? o.score ?? 0.9),
-          }))
-        );
-
-        const recipe =
-          data.recipe?.text ??
-          data.recipe ??
-          data.result ??
-          data.choices?.[0]?.message?.content ??
-          "";
-        if (recipe) setRecipeText(String(recipe));
-
-        setIsProcessed(true);
-        toast({
-          title: "Analysis complete",
-          description: recipe ? "Recipe generated" : `Found ${objects.length} items`,
-          duration: 3500,
-        });
-      } else {
-        // Fallback demo if no external API configured
-        const mock = [
-          { label: "Tomatoes", confidence: 0.95 },
-          { label: "Onions", confidence: 0.90 },
-          { label: "Garlic", confidence: 0.88 },
-        ];
-        setDetectedObjects(mock);
-        setRecipeText(
-          "Simple Tomato Onion Curry:\n1) Saute onions + garlic\n2) Add tomatoes + spices\n3) Simmer and serve."
-        );
-        setIsProcessed(true);
-        toast({ title: "Demo analysis", description: `Found ${mock.length} items`, duration: 3000 });
-      }
+          // Suggest a recipe from Supabase database using detected ingredients
+          try {
+            const ingredientNames = ingredients.map(i => i.label).filter(Boolean);
+            if (ingredientNames.length > 0) {
+              const { data, error } = await supabase
+                .from("recipes")
+                .select("title, description, recipe_ingredients(ingredient_id, ingredients(name))")
+                .in("recipe_ingredients.ingredients.name", ingredientNames);
+              if (error) {
+                setRecipeText("Could not fetch recipe suggestions.");
+              } else if (data && data.length > 0) {
+                const recipe = data[0];
+                setRecipeText(
+                  `Suggested Recipe: ${recipe.title}\n${recipe.description || ""}`
+                );
+              } else {
+                setRecipeText("No matching recipes found in database.");
+              }
+            }
+          } catch (err) {
+            setRecipeText("Error suggesting recipe from database.");
+          }
+        } catch (error: any) {
+          setDetectedObjects([]); // Clear detected ingredients on error
+          setIsProcessed(false);
+          toast({
+            title: "Gemini AI error",
+            description: error?.message ?? "Unable to analyze image. Please check your Gemini API key and model access.",
+            variant: "destructive",
+            duration: 5000,
+          });
+        } finally {
+          setIsProcessing(false);
+        }
+      };
+      reader.readAsDataURL(file);
     } catch (error: any) {
+      setDetectedObjects([]); // Clear detected ingredients on error
+      setIsProcessed(false);
       toast({
         title: "Analysis error",
-        description: error?.message ?? "Unable to analyze image",
+        description: error?.message ?? "Unable to analyze image. Please check your Gemini API key and model access.",
         variant: "destructive",
         duration: 5000,
       });
-    } finally {
-      setIsProcessing(false);
     }
   };
 
@@ -124,15 +194,8 @@ const Upload = () => {
   };
 
   const detectedIngredients = detectedObjects.length
-    ? detectedObjects.map((o) => ({ name: o.label, confidence: Math.round(o.confidence * 100) }))
-    : [
-        { name: "Tomatoes", confidence: 95 },
-        { name: "Onions", confidence: 90 },
-        { name: "Ginger", confidence: 85 },
-        { name: "Garlic", confidence: 88 },
-        { name: "Cilantro", confidence: 82 },
-        { name: "Green Chilies", confidence: 79 }
-      ];
+    ? detectedObjects.map((o) => ({ name: o.label }))
+    : [];
 
   return (
     <div className="min-h-screen bg-animated pt-20 pb-12 px-4">
@@ -214,6 +277,30 @@ const Upload = () => {
                 onChange={handleImageUpload}
                 className="hidden"
               />
+
+              {/* Manual ingredient entry */}
+              <form onSubmit={handleManualSearch} className="mt-6 flex flex-col items-center">
+                <label htmlFor="manual-ingredient" className="mb-2 font-medium text-lg text-muted-foreground">Or type your ingredient:</label>
+                <input
+                  id="manual-ingredient"
+                  type="text"
+                  value={manualIngredient}
+                  onChange={e => {
+                    setManualIngredient(e.target.value);
+                    console.log('Manual ingredient input:', e.target.value);
+                  }}
+                  placeholder="e.g. Apple, Tomato, Rice..."
+                  className="border rounded px-4 py-2 w-full max-w-xs focus:outline-none focus:ring focus:border-primary"
+                  disabled={manualLoading}
+                />
+                <Button
+                  type="submit"
+                  className="mt-3 w-full max-w-xs"
+                  disabled={!manualIngredient.trim()}
+                >
+                  {manualLoading ? "Searching..." : "Find Recipe"}
+                </Button>
+              </form>
             </CardContent>
           </Card>
 
@@ -254,9 +341,6 @@ const Upload = () => {
                             <CheckCircle className="h-4 w-4 text-green-500" />
                             <span className="font-medium">{ingredient.name}</span>
                           </div>
-                          <span className="text-sm text-muted-foreground">
-                            {ingredient.confidence}%
-                          </span>
                         </div>
                       ))}
                     </div>
